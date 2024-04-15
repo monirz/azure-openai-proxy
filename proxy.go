@@ -188,16 +188,6 @@ func Proxy(c *gin.Context, requestConverter RequestConverter) {
 
 	proxy.ServeHTTP(c.Writer, c.Request)
 
-	// Streaming the response
-	if c.Writer.Status() == http.StatusOK {
-		log.Println("test-------------")
-		// Stream the response from the original server to the client
-		_, err := io.Copy(c.Writer, c.Request.Body)
-		if err != nil {
-			log.Println(err)
-		}
-	}
-
 	// issue: https://github.com/Chanzhaoyu/chatgpt-web/issues/831
 	if c.Writer.Header().Get("Content-Type") == "text/event-stream" {
 		if _, err := c.Writer.Write([]byte{'\n'}); err != nil {
