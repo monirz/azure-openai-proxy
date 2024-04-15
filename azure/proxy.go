@@ -7,10 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"net/http/httputil"
 	"strings"
-	"sync"
-	"time"
 
 	"github.com/stulzq/azure-openai-proxy/util"
 
@@ -104,15 +101,9 @@ func ModelProxy(c *gin.Context) {
 	c.String(http.StatusOK, string(combinedResults))
 }
 
-var bufferPool = &sync.Pool{
-	New: func() interface{} {
-		return &bytes.Buffer{}
-	},
-}
-
 // Proxy Azure OpenAI
-func Proxy(c *gin.Context, requestConverter RequestConverter) {
 
+func Proxy(c *gin.Context, requestConverter RequestConverter) {
 	if c.Request.Method == http.MethodOptions {
 		c.Header("Access-Control-Allow-Origin", "*")
 		c.Header("Access-Control-Allow-Methods", "GET, OPTIONS, POST")
@@ -121,153 +112,162 @@ func Proxy(c *gin.Context, requestConverter RequestConverter) {
 		return
 	}
 
-	// preserve request body for error logging
-	var buf bytes.Buffer
-	tee := io.TeeReader(c.Request.Body, &buf)
-	bodyBytes, err := io.ReadAll(tee)
-	if err != nil {
-		log.Printf("Error reading request body: %v", err)
+	// Check if the request body is empty
+	if c.Request.Body == nil {
+		util.SendError(c, errors.New("request body is empty"))
 		return
 	}
-	c.Request.Body = io.NopCloser(&buf)
 
-	director := func(req *http.Request) {
-		if req.Body == nil {
-			util.SendError(c, errors.New("request body is empty"))
-			return
-		}
-		body, _ := io.ReadAll(req.Body)
-		req.Body = io.NopCloser(bytes.NewBuffer(body))
-
-		// get model from url params or body
-		model := c.Param("model")
-		if model == "" {
-			_model, err := sonic.Get(body, "model")
-			if err != nil {
-				util.SendError(c, errors.Wrap(err, "get model error"))
-				return
-			}
-			_modelStr, err := _model.String()
-			if err != nil {
-				util.SendError(c, errors.Wrap(err, "get model name error"))
-				return
-			}
-			model = _modelStr
-		}
-
-		// get deployment from request
-		deployment, err := GetDeploymentByModel(model)
-		if err != nil {
-			util.SendError(c, err)
-			return
-		}
-
-		// get auth token from header or deployemnt config
-		token := deployment.ApiKey
-		if token == "" {
-			rawToken := req.Header.Get("Authorization")
-			token = strings.TrimPrefix(rawToken, "Bearer ")
-		}
-		if token == "" {
-			util.SendError(c, errors.New("token is empty"))
-			return
-		}
-		req.Header.Set(AuthHeaderKey, token)
-		req.Header.Del("Authorization")
-
-		originURL := req.URL.String()
-		req, err = requestConverter.Convert(req, deployment)
-		if err != nil {
-			util.SendError(c, errors.Wrap(err, "convert request error"))
-			return
-		}
-		log.Printf("proxying request [%s] %s -> %s", model, originURL, req.URL.String())
-	}
-
-	proxy := &httputil.ReverseProxy{Director: director}
-	transport, err := util.NewProxyFromEnv()
+	// Read the request body
+	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
-		util.SendError(c, errors.Wrap(err, "get proxy error"))
+		util.SendError(c, errors.Wrap(err, "error reading request body"))
 		return
 	}
-	if transport != nil {
-		proxy.Transport = transport
-	}
+	defer c.Request.Body.Close()
 
-	// Get a buffer from the pool
-	buffer := bufferPool.Get().(*bytes.Buffer)
-	defer bufferPool.Put(buffer)
+	// Create a new request object with the original request's properties
+	req := c.Request.WithContext(c.Request.Context())
+	req.Body = io.NopCloser(bytes.NewReader(body))
 
-	// Set up a timer to flush the buffer periodically
-	ticker := time.NewTicker(200 * time.Millisecond)
-	defer ticker.Stop()
-
-	chunkedWriter := httputil.NewChunkedWriter(c.Writer)
-	defer chunkedWriter.Close()
-
-	// Use a buffered channel for backpressure
-	flushChan := make(chan []byte, 10) // Adjust the buffer size as needed
-
-	// Start a goroutine pool for flushing the buffers concurrently
-	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ { // Adjust the number of goroutines as needed
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for data := range flushChan {
-				_, err := chunkedWriter.Write(data)
-				if err != nil {
-					log.Printf("Error writing response: %v", err)
-					return
-				}
-			}
-		}()
-	}
-
-	go func() {
-		defer func() {
-			close(flushChan) // Signal the end of the channel
-			wg.Wait()        // Wait for all goroutines to finish
-		}()
-
-		for {
-			select {
-			case <-ticker.C:
-				// Flush the buffer to the client
-				data := buffer.Bytes()
-				if len(data) > 0 {
-					select {
-					case flushChan <- data:
-						buffer.Reset()
-					default:
-
-					}
-				}
-			case <-c.Writer.CloseNotify():
-				// Client disconnected, exit the goroutine
-				return
-			}
+	// Get model from URL params or body
+	model := c.Param("model")
+	if model == "" {
+		_model, err := sonic.Get(body, "model")
+		if err != nil {
+			util.SendError(c, errors.Wrap(err, "get model error"))
+			return
 		}
-	}()
+		model, err = _model.String()
+		if err != nil {
+			util.SendError(c, errors.Wrap(err, "get model name error"))
+			return
+		}
+	}
 
-	// Proxy the request and append the response chunks to the buffer
-	proxy.ServeHTTP(&bufferWriterCloser{ResponseWriter: c.Writer, WriteCloser: chunkedWriter, Buffer: buffer}, c.Request)
+	// Get deployment by model
+	deployment, err := GetDeploymentByModel(model)
+	if err != nil {
+		util.SendError(c, err)
+		return
+	}
 
-	// Flush any remaining data in the buffer
-	if buffer.Len() > 0 {
-		flushChan <- buffer.Bytes()
+	// Get auth token from header or deployment config
+	token := deployment.ApiKey
+	if token == "" {
+		rawToken := req.Header.Get("Authorization")
+		token = strings.TrimPrefix(rawToken, "Bearer ")
+	}
+	if token == "" {
+		util.SendError(c, errors.New("token is empty"))
+		return
+	}
+	req.Header.Set(AuthHeaderKey, token)
+	req.Header.Del("Authorization")
+
+	req.Header.Set("Transfer-Encoding", "chunked")
+
+	// Convert request using the request converter
+	req, err = requestConverter.Convert(req, deployment)
+	if err != nil {
+		util.SendError(c, errors.Wrap(err, "convert request error"))
+		return
+	}
+
+	// Log the proxying request
+	log.Printf("proxying request [%s] %s -> %s", model, c.Request.URL.String(), req.URL.String())
+
+	// Forward the request to the target URL
+	targetURL := req.URL.String()
+	resp, err := forwardRequest(req, targetURL)
+	if err != nil {
+		util.SendError(c, errors.Wrap(err, "forward request error"))
+		return
+	}
+	defer resp.Body.Close()
+
+	// Copy the response headers from the target to the client
+	for key, values := range resp.Header {
+		for _, value := range values {
+			c.Header(key, value)
+		}
+	}
+
+	c.Status(resp.StatusCode)
+
+	// Set the status code of the response
+	// Get the client's response writer
+	clientWriter := c.Writer
+
+	// Stream the response body from the target to the client
+	buf := make([]byte, 1024)
+	for {
+		n, err := resp.Body.Read(buf)
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("Error reading response body: %v", err)
+			}
+			break
+		}
+
+		// Write the chunk of data to the client
+		_, err = clientWriter.Write(buf[:n])
+		if err != nil {
+			log.Printf("Error writing response body to client: %v", err)
+			break
+		}
+
+		// Flush the response writer to ensure data is sent immediately
+		clientWriter.Flush()
 	}
 
 	// issue: https://github.com/Chanzhaoyu/chatgpt-web/issues/831
 	if c.Writer.Header().Get("Content-Type") == "text/event-stream" {
+		log.Println("Content-Type: event-stream")
 		if _, err := c.Writer.Write([]byte{'\n'}); err != nil {
 			log.Printf("rewrite response error: %v", err)
 		}
 	}
 
 	if c.Writer.Status() != 200 {
-		log.Printf("encountering error with body: %s", string(bodyBytes))
+		log.Printf("encountering error with body: %s", string(body))
 	}
+}
+
+func forwardRequest(req *http.Request, targetURL string) (*http.Response, error) {
+	// Create a new HTTP client
+	client := &http.Client{}
+
+	// Create a new request to the target URL
+	targetReq, err := http.NewRequest(req.Method, targetURL, req.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	// Set headers and other properties from the original request
+	targetReq.Header = req.Header
+
+	// Perform the proxy request
+	resp, err := client.Do(targetReq)
+	if err != nil {
+		return nil, err
+	}
+
+	return resp, nil
+}
+
+// StreamingWriter is a wrapper to handle streaming response bodies
+type customResponseWriter struct {
+	http.ResponseWriter
+	writer io.Writer
+}
+
+func (w *customResponseWriter) Write(p []byte) (int, error) {
+	written, err := w.ResponseWriter.Write(p)
+	if err == nil {
+		w.writer.Write(p)
+	}
+	return written, err
 }
 
 func GetDeploymentByModel(model string) (*DeploymentConfig, error) {
@@ -276,22 +276,4 @@ func GetDeploymentByModel(model string) (*DeploymentConfig, error) {
 		return nil, errors.New(fmt.Sprintf("deployment config for %s not found", model))
 	}
 	return &deploymentConfig, nil
-}
-
-type bufferWriterCloser struct {
-	http.ResponseWriter
-	io.WriteCloser
-	Buffer *bytes.Buffer
-}
-
-func (w *bufferWriterCloser) Write(data []byte) (int, error) {
-	n, err := w.WriteCloser.Write(data)
-	if err != nil {
-		return n, err
-	}
-	m, err := w.Buffer.Write(data)
-	if err != nil {
-		return m, err
-	}
-	return len(data), nil
 }
