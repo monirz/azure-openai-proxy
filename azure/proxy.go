@@ -102,7 +102,6 @@ func ModelProxy(c *gin.Context) {
 }
 
 // Proxy Azure OpenAI
-
 func Proxy(c *gin.Context, requestConverter RequestConverter) {
 	if c.Request.Method == http.MethodOptions {
 		c.Header("Access-Control-Allow-Origin", "*")
