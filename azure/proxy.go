@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/stulzq/azure-openai-proxy/util"
 
@@ -102,8 +104,15 @@ func ModelProxy(c *gin.Context) {
 	c.String(http.StatusOK, string(combinedResults))
 }
 
+var bufferPool = &sync.Pool{
+	New: func() interface{} {
+		return &bytes.Buffer{}
+	},
+}
+
 // Proxy Azure OpenAI
 func Proxy(c *gin.Context, requestConverter RequestConverter) {
+
 	if c.Request.Method == http.MethodOptions {
 		c.Header("Access-Control-Allow-Origin", "*")
 		c.Header("Access-Control-Allow-Methods", "GET, OPTIONS, POST")
@@ -186,7 +195,69 @@ func Proxy(c *gin.Context, requestConverter RequestConverter) {
 		proxy.Transport = transport
 	}
 
-	proxy.ServeHTTP(c.Writer, c.Request)
+	// Get a buffer from the pool
+	buffer := bufferPool.Get().(*bytes.Buffer)
+	defer bufferPool.Put(buffer)
+
+	// Set up a timer to flush the buffer periodically
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+
+	chunkedWriter := httputil.NewChunkedWriter(c.Writer)
+	defer chunkedWriter.Close()
+
+	// Use a buffered channel for backpressure
+	flushChan := make(chan []byte, 10) // Adjust the buffer size as needed
+
+	// Start a goroutine pool for flushing the buffers concurrently
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ { // Adjust the number of goroutines as needed
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for data := range flushChan {
+				_, err := chunkedWriter.Write(data)
+				if err != nil {
+					log.Printf("Error writing response: %v", err)
+					return
+				}
+			}
+		}()
+	}
+
+	go func() {
+		defer func() {
+			close(flushChan) // Signal the end of the channel
+			wg.Wait()        // Wait for all goroutines to finish
+		}()
+
+		for {
+			select {
+			case <-ticker.C:
+				// Flush the buffer to the client
+				data := buffer.Bytes()
+				if len(data) > 0 {
+					select {
+					case flushChan <- data:
+						buffer.Reset()
+					default:
+
+					}
+				}
+			case <-c.Writer.CloseNotify():
+				// Client disconnected, exit the goroutine
+				return
+			}
+		}
+	}()
+
+	// Proxy the request and append the response chunks to the buffer
+	proxy.ServeHTTP(&bufferWriterCloser{ResponseWriter: c.Writer, WriteCloser: chunkedWriter, Buffer: buffer}, c.Request)
+
+	// Flush any remaining data in the buffer
+	if buffer.Len() > 0 {
+		flushChan <- buffer.Bytes()
+	}
 
 	// Streaming the response
 	if c.Writer.Status() == http.StatusOK {
@@ -216,4 +287,22 @@ func GetDeploymentByModel(model string) (*DeploymentConfig, error) {
 		return nil, errors.New(fmt.Sprintf("deployment config for %s not found", model))
 	}
 	return &deploymentConfig, nil
+}
+
+type bufferWriterCloser struct {
+	http.ResponseWriter
+	io.WriteCloser
+	Buffer *bytes.Buffer
+}
+
+func (w *bufferWriterCloser) Write(data []byte) (int, error) {
+	n, err := w.WriteCloser.Write(data)
+	if err != nil {
+		return n, err
+	}
+	m, err := w.Buffer.Write(data)
+	if err != nil {
+		return m, err
+	}
+	return len(data), nil
 }
